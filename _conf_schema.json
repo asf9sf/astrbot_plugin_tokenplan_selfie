@@ -74,7 +74,7 @@
     "description": "启用 LLM 工具（AI 自主拍照）",
     "type": "bool",
     "default": true,
-    "hint": "开启后需要在人格设置里勾选 take_selfie 和 take_photo 两个工具"
+    "hint": "开启后需要在人格设置里勾选三个工具：take_selfie、take_photo、lock_face。勾了 lock_face 才能直接对 AI 说「用这张脸」来锁脸"
   },
   "inject_prompt": {
     "description": "向 LLM 注入拍照能力提示",

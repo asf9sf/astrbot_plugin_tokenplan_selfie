@@ -267,25 +267,67 @@ class SelfiePlugin(Star):
         mime = sniff_mime(raw)
         return f"data:{mime};base64," + base64.b64encode(raw).decode()
 
-    def _save_lock(self, src: Path, session_id: str) -> None:
-        target = self.face_dir / "locked.png"
+    def _apply_lock(self, raw: bytes, source: str, session_id: str) -> str:
+        """把图片字节写成锁定的脸，返回实际使用的后缀。"""
+        suffix = {"image/jpeg": "jpg", "image/webp": "webp", "image/bmp": "bmp"}.get(
+            sniff_mime(raw), "png"
+        )
+        target = self.face_dir / f"locked.{suffix}"
         for old in self.face_dir.glob("locked.*"):
-            if old.suffix != ".json":
+            if old != target:
                 try:
                     old.unlink()
                 except OSError:
                     pass
-        target.write_bytes(src.read_bytes())
+        target.write_bytes(raw)
         meta = {
             "locked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "session": session_id,
-            "face": self.character_face,
-            "source": src.name,
+            "face": self._load_appearance() or self.character_face,
+            "source": source,
         }
         self._meta_path().write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n"
         )
-        logger.info(f"[Selfie] 已锁定角色长相：{src.name}")
+        logger.info(f"[Selfie] 已锁定角色长相（{source}，{suffix}，{len(raw)} 字节）")
+        return suffix
+
+    def _save_lock(self, src: Path, session_id: str) -> None:
+        self._apply_lock(src.read_bytes(), src.name, session_id)
+
+    # ---------------- 待锁图缓存（用户直接发图时） ----------------
+
+    def _pending_path(self) -> Path:
+        return self.face_dir / "pending.img"
+
+    async def _cache_pending_image(self, event: AstrMessageEvent) -> None:
+        """用户发图时先把图存下来，等 AI 判断是否要锁定。"""
+        imgs = self._extract_images(event)
+        if not imgs:
+            return
+        try:
+            raw = base64.b64decode(await imgs[0].convert_to_base64())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Selfie] 缓存待锁图失败: {exc}")
+            return
+        if len(raw) < 1024:
+            return
+        try:
+            self._pending_path().write_bytes(raw)
+            logger.info(f"[Selfie] 已缓存一张待锁定的图（{len(raw)} 字节）")
+        except OSError as exc:
+            logger.warning(f"[Selfie] 写入待锁图失败: {exc}")
+
+    def _take_pending_image(self, max_age: int = 3600) -> bytes | None:
+        p = self._pending_path()
+        try:
+            if not p.exists():
+                return None
+            if time.time() - p.stat().st_mtime > max_age:
+                return None
+            return p.read_bytes()
+        except OSError:
+            return None
 
     # ---------------- 提示词 ----------------
 
@@ -409,6 +451,41 @@ class SelfiePlugin(Star):
         yield await self._do_photo(event, scene)
         return
 
+    @filter.llm_tool("lock_face")
+    async def lock_face(self, event: AstrMessageEvent):
+        """把用户发来的照片锁定为角色本人的长相，之后所有自拍都以这张脸为准。
+
+        仅在用户明确表达确认意图时调用，例如「就用这张脸」「记住我长这样」
+        「以后都按这张」「就长这样吧」「这个就是我」。
+        用户只是发图聊天、问问题、让你评价照片、或发的是风景/物品时，不要调用。
+        """
+        event = unwrap_event(event)
+
+        raw: bytes | None = None
+        imgs = self._extract_images(event)
+        if imgs:
+            try:
+                raw = base64.b64decode(await imgs[0].convert_to_base64())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[Selfie] 读取当前消息图片失败: {exc}")
+                raw = None
+
+        # 当前消息没有图（用户先发图、后说话）就取最近缓存的那张
+        if not raw or len(raw) < 1024:
+            raw = self._take_pending_image()
+
+        if not raw or len(raw) < 1024:
+            yield (
+                "没有拿到可用的照片。请让用户先发一张清晰的正脸照，再执行锁定。"
+            )
+            return
+
+        self._apply_lock(raw, "chat_upload", self._session_id(event))
+        yield (
+            "已把这张照片锁定为角色的长相。之后换衣服、换场景的自拍都会以这张脸为准。"
+            "不要再用文字重复描述这张照片。"
+        )
+
     async def _do_selfie(
         self,
         event: AstrMessageEvent,
@@ -504,6 +581,12 @@ class SelfiePlugin(Star):
         except Exception:  # noqa: BLE001
             pass
 
+        # 用户这一轮如果发了图，先存下来，等 AI 决定要不要锁成角色的脸
+        try:
+            await self._cache_pending_image(event)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Selfie] 缓存待锁图异常: {exc}")
+
         if not (self.enable_tool and self.inject_prompt):
             return
         locked = "已锁定" if self._locked_image() else "未锁定"
@@ -513,6 +596,10 @@ class SelfiePlugin(Star):
             "当用户想看你的样子、问你在做什么、想看你眼前的东西时，主动拍给他看。"
             "场景、穿着、神态要贴合人设和上下文，不要与剧情矛盾。"
             "工具的 scene/outfit/mood 参数直接影响画面，请写成具体可拍的描述，不要用抽象词。"
+            "另外你具备「锁定长相」的能力：当用户发来一张照片，并明确表示"
+            "「就用这张脸」「记住我长这样」「以后按这张」「就长这样吧」，"
+            "调用 `lock_face` 把这张照片定为角色本人的长相。"
+            "用户只是发图聊天、问问题、或让你评价照片时，绝对不要调用 lock_face。"
             f"当前角色长相：{locked}。"
         )
         try:
@@ -616,31 +703,7 @@ class SelfiePlugin(Star):
                 yield event.plain_result("这张图好像没读完整，换一张试试。")
                 return
 
-            suffix = {"image/jpeg": "jpg", "image/webp": "webp", "image/bmp": "bmp"}.get(
-                sniff_mime(raw), "png"
-            )
-            target = self.face_dir / f"locked.{suffix}"
-            target.write_bytes(raw)
-            # 清掉旧的不同后缀文件，避免读到旧图
-            for old in self.face_dir.glob("locked.*"):
-                if old != target and old.suffix != ".json":
-                    try:
-                        old.unlink()
-                    except OSError:
-                        pass
-
-            meta = {
-                "locked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "session": self._session_id(event),
-                "face": self._load_appearance() or self.character_face,
-                "source": "upload",
-            }
-            self._meta_path().write_text(
-                json.dumps(meta, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-                newline="\n",
-            )
-            logger.info(f"[Selfie] 已用上传图片锁定角色长相（{suffix}，{len(raw)} 字节）")
+            self._apply_lock(raw, "upload", self._session_id(event))
             yield event.plain_result(
                 "已用你上传的这张图锁定角色长相。之后换衣服、换场景都会以这张脸为准。",
             )
