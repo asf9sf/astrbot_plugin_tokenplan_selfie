@@ -20,8 +20,8 @@
   "model_with_reference": {
     "description": "带参考图模型（锁脸用）",
     "type": "string",
-    "default": "qwen-image-3.0-pro",
-    "hint": "必须选支持参考图（image_urls）的模型，qwen-image-3.0-pro 的人物身份保持最好。若想更省钱可改 wan2.7-image，但脸的一致性会差一些"
+    "default": "wan2.7-image",
+    "hint": "默认 wan2.7-image（0.20 元/张，本身支持参考图，最省）。若实测换场景后脸漂移明显，改成 wan2.7-image-pro（0.50 元）或 qwen-image-3.0-pro，主体一致性更强但贵 2.5 倍"
   },
   "image_size": {
     "description": "出图尺寸",
