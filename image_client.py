@@ -175,18 +175,21 @@ class TokenPlanImageClient:
         prompt: str,
         count: int,
         reference_b64: str | None = None,
+        prompts: list[str] | None = None,
     ) -> list[tuple[str, bool]]:
         """并发生成多张（同步接口一次只出一张）。
 
         最多 2 路并发，避免一次打满 RPM 触发限流。
+        prompts 不为空时按序号逐张使用不同提示词（用于生成有差异的候选）。
         """
         sem = asyncio.Semaphore(2)
 
-        async def _one():
+        async def _one(idx: int):
             async with sem:
-                return await self.generate_one(prompt, reference_b64=reference_b64)
+                p = prompts[idx] if prompts and idx < len(prompts) else prompt
+                return await self.generate_one(p, reference_b64=reference_b64)
 
-        tasks = [asyncio.create_task(_one()) for _ in range(max(1, count))]
+        tasks = [asyncio.create_task(_one(i)) for i in range(max(1, count))]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         out: list[tuple[str, bool]] = []
         errors: list[str] = []

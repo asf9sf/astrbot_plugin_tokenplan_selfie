@@ -32,6 +32,16 @@ TOOL_PHOTO = "take_photo"
 
 DEFAULT_FACE = "一位年轻女性，黑色长发，琥珀色眼睛，皮肤白皙，五官清秀"
 
+# 候选自拍轮流使用不同的拍摄角度，让几张候选有明显差异，方便挑选
+SELFIE_ANGLES = (
+    "手机前置摄像头自拍，近距离半身，自然光，真实照片质感",
+    "对着镜子自拍，手机挡住下半张脸，室内暖光",
+    "略微俯拍的近景自拍，微微仰头，柔和顶光",
+    "侧脸自拍，逆光，发丝边缘泛光，浅景深",
+    "户外随手自拍，背景轻微虚化，自然日光",
+    "低头看镜头的特写自拍，顶光，情绪感强",
+)
+
 
 def unwrap_event(arg):
     """兼容新旧版本：工具入参可能是 AstrMessageEvent 或 ContextWrapper。"""
@@ -70,6 +80,8 @@ class SelfiePlugin(Star):
         self.enable_tool: bool = bool(cfg("enable_tool", True))
         self.inject_prompt: bool = bool(cfg("inject_prompt", True))
         self.keep_candidates: int = int(cfg("keep_candidates", 60) or 60)
+        self.face_from_persona: bool = bool(cfg("face_from_persona", True))
+        self.appearance_hint: str = str(cfg("appearance_hint", "") or "").strip()
 
         self.client = TokenPlanImageClient(
             api_key=self.api_key,
@@ -91,6 +103,8 @@ class SelfiePlugin(Star):
         self.cand_dir.mkdir(parents=True, exist_ok=True)
 
         self._last_call: dict[str, float] = {}
+        # 每轮 LLM 请求时缓存当前人格，供「人设 → 外貌描述」使用
+        self._persona_cache: dict[str, str] = {}
 
         locked = self._locked_image()
         logger.info(
@@ -110,6 +124,118 @@ class SelfiePlugin(Star):
 
     def _meta_path(self) -> Path:
         return self.face_dir / "face.json"
+
+    # ---------------- 外貌描述（人设 → 提示词） ----------------
+
+    def _appearance_path(self) -> Path:
+        return self.face_dir / "appearance.txt"
+
+    def _load_appearance(self) -> str:
+        p = self._appearance_path()
+        try:
+            return p.read_text(encoding="utf-8").strip() if p.exists() else ""
+        except OSError:
+            return ""
+
+    def _save_appearance(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        try:
+            self._appearance_path().write_text(text, encoding="utf-8", newline="\n")
+        except OSError as exc:
+            logger.warning(f"[Selfie] 保存外貌描述失败: {exc}")
+
+    async def _summarize_appearance(self, persona: str) -> str:
+        """让人设所在的大模型把角色人设总结成一段可用的生图外貌描述。"""
+        try:
+            provider = self.context.get_using_provider()
+        except TypeError:
+            try:
+                provider = self.context.get_using_provider(None)
+            except Exception:  # noqa: BLE001
+                provider = None
+        except Exception:  # noqa: BLE001
+            provider = None
+
+        if not provider:
+            logger.warning("[Selfie] 没有可用的 LLM Provider，无法从人设生成外貌")
+            return ""
+
+        task = (
+            "请只输出一段外貌描述，用于 AI 绘画提示词，描述这个人长什么样。\n"
+            "必须包含：性别与年龄感、发型与发色、眼睛颜色与形状、脸型、肤色、体型，"
+            "以及 1-2 个辨识度高的特征（例如泪痣、耳钉、眉形）。\n"
+            "不要写性格、职业、身份、剧情；不要写衣服和场景；"
+            "不要任何前缀、引号、解释或换行；只输出 40-80 字的连续中文描述。"
+        )
+        prompt = f"以下是这个角色的人设设定：\n{persona[:1500]}\n\n{task}" if persona else task
+        if self.appearance_hint:
+            prompt += f"\n补充要求：{self.appearance_hint}"
+
+        try:
+            resp = await provider.text_chat(
+                prompt=prompt,
+                contexts=[],
+                system_prompt=(
+                    "你是一名专精人物设定的美术指导，擅长把文字人设转写成精准、"
+                    "可直接用于 AI 绘画的视觉外貌描述。只输出描述本身。"
+                ),
+            )
+            text = (getattr(resp, "completion_text", "") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Selfie] 人设转外貌失败: {exc}")
+            return ""
+
+        text = text.replace("\n", " ").strip().strip('"').strip("“”").strip("「」")
+        return text[:200]
+
+    def _persona_from_config(self) -> str:
+        """兜底：从 AstrBot 配置里尝试读取默认人格文本。"""
+        try:
+            conf = self.context.get_config()
+        except Exception:  # noqa: BLE001
+            return ""
+        if not conf:
+            return ""
+        for key in ("persona", "personas"):
+            try:
+                items = conf.get(key) or []
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(items, dict):
+                items = [items]
+            if isinstance(items, str):
+                return items.strip()
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if isinstance(item, dict):
+                    for field in ("system_prompt", "prompt", "content", "text"):
+                        val = item.get(field)
+                        if isinstance(val, str) and val.strip():
+                            return val.strip()
+                elif isinstance(item, str) and item.strip():
+                    return item.strip()
+        return ""
+
+    def _persona_text(self, event: AstrMessageEvent) -> str:
+        return self._persona_cache.get(self._session_id(event), "") or self._persona_from_config()
+
+    async def _ensure_appearance(self, event: AstrMessageEvent) -> str:
+        """拿一段固定的外貌描述：已有缓存直接用，否则按人设总结一次并存下来。"""
+        cached = self._load_appearance()
+        if cached:
+            return cached
+
+        text = ""
+        if self.face_from_persona:
+            text = await self._summarize_appearance(self._persona_text(event))
+        if not text:
+            text = self.character_face
+        self._save_appearance(text)
+        logger.info(f"[Selfie] 已生成外貌描述：{text[:60]}…")
+        return text
 
     def _load_reference_b64(self) -> str | None:
         p = self._locked_image()
@@ -139,14 +265,14 @@ class SelfiePlugin(Star):
     # ---------------- 提示词 ----------------
 
     def _base_face(self) -> str:
-        face = self.character_face
-        locked = self._locked_image()
-        if locked:
+        # 优先用按人设总结出来的外貌描述，其次用配置里的固定描述
+        face = self._load_appearance() or self.character_face
+        if self._locked_image():
             # 有参考图时，文字侧再强调一次"与参考图同一个人"
             face += "，五官和脸型必须与参考图中的是同一个人"
         return face
 
-    def _selfie_prompt(self, scene: str, outfit: str, mood: str) -> str:
+    def _selfie_prompt(self, scene: str, outfit: str, mood: str, angle: str = "") -> str:
         parts = [self._base_face()]
         if outfit:
             parts.append(f"穿着{outfit}")
@@ -156,7 +282,7 @@ class SelfiePlugin(Star):
             parts.append(f"神态{mood}")
         if self.selfie_style:
             parts.append(self.selfie_style)
-        parts.append("手机前置摄像头自拍，近距离半身构图，自然光，真实照片质感，生活照")
+        parts.append(angle or "手机前置摄像头自拍，近距离半身构图，自然光，真实照片质感，生活照")
         return "，".join(parts)
 
     def _photo_prompt(self, scene: str) -> str:
@@ -263,6 +389,7 @@ class SelfiePlugin(Star):
                 return f"生成失败：{label}描述过长（{len(val)} 字），请压缩到 {self.max_prompt_chars} 字以内。"
 
         self._mark_call(event)
+        await self._ensure_appearance(event)
         prompt = self._selfie_prompt(scene, outfit, mood)
         ref = self._load_reference_b64()
 
@@ -329,6 +456,16 @@ class SelfiePlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        # 顺手把当前 system_prompt（内含人格设定）缓存下来，
+        # 供「人设 → 外貌描述」使用；即使关闭提示注入也要缓存。
+        try:
+            sid = self._session_id(event)
+            sp = getattr(req, "system_prompt", "") or ""
+            if sp:
+                self._persona_cache[sid] = sp[:2000]
+        except Exception:  # noqa: BLE001
+            pass
+
         if not (self.enable_tool and self.inject_prompt):
             return
         locked = "已锁定" if self._locked_image() else "未锁定"
@@ -366,13 +503,31 @@ class SelfiePlugin(Star):
 
         n = count if 1 <= count <= 8 else self.candidate_count
         self._mark_call(event)
-        prompt = self._selfie_prompt("", "", "")
         ref = self._load_reference_b64()
 
+        # 先按人设总结出固定外貌，再据此出图（只总结一次，之后复用）
+        first_time = not self._load_appearance()
+        if first_time and self.face_from_persona and not self._persona_text(event):
+            yield event.plain_result(
+                "还没拿到你的人格设定，这次先用兜底描述生成。"
+                "想更贴合角色，先随便跟我聊一句话再发 /自拍。",
+            )
+        elif first_time:
+            yield event.plain_result("先根据人设总结一下角色的长相，稍等…")
+        appearance = await self._ensure_appearance(event)
+        if first_time:
+            yield event.plain_result(f"外貌已定：{appearance}")
+
+        prompts = [
+            self._selfie_prompt("", "", "", SELFIE_ANGLES[i % len(SELFIE_ANGLES)])
+            for i in range(n)
+        ]
         yield event.plain_result(f"正在拍 {n} 张，稍等一下…")
 
         try:
-            results = await self.client.generate_many(prompt, n, reference_b64=ref)
+            results = await self.client.generate_many(
+                prompts[0], n, reference_b64=ref, prompts=prompts
+            )
         except ImageError as exc:
             yield event.plain_result(f"生成失败：{exc}")
             return
@@ -466,3 +621,28 @@ class SelfiePlugin(Star):
             f"参考图模型：{self.client.model_i2i}",
         ]
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("外貌")
+    async def cmd_appearance(self, event: AstrMessageEvent):
+        """查看当前用来出图的外貌描述"""
+        text = self._load_appearance()
+        if not text:
+            yield event.plain_result(
+                "还没有外貌描述。发 /自拍 会自动根据人设总结一份，"
+                "或用 /外貌重写 立刻重新总结。",
+            )
+            return
+        yield event.plain_result(f"当前角色外貌描述：\n{text}")
+
+    @filter.command("外貌重写")
+    async def cmd_rewrite_appearance(self, event: AstrMessageEvent):
+        """丢弃旧的外貌描述，按当前人设重新总结一份"""
+        p = self._appearance_path()
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        yield event.plain_result("正在根据人设重新总结外貌…")
+        text = await self._ensure_appearance(event)
+        yield event.plain_result(f"新的外貌描述：\n{text}")
