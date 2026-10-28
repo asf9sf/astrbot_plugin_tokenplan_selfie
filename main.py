@@ -43,6 +43,21 @@ SELFIE_ANGLES = (
 )
 
 
+def sniff_mime(raw: bytes) -> str:
+    """按文件头判断图片 MIME，data URI 里用错了模型会拒绝收。"""
+    if raw.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if raw.startswith(b"\x89PNG"):
+        return "image/png"
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return "image/webp"
+    if raw.startswith(b"GIF8"):
+        return "image/gif"
+    if raw.startswith(b"BM"):
+        return "image/bmp"
+    return "image/png"
+
+
 def unwrap_event(arg):
     """兼容新旧版本：工具入参可能是 AstrMessageEvent 或 ContextWrapper。"""
     if arg is None:
@@ -119,8 +134,11 @@ class SelfiePlugin(Star):
     # ---------------- 锁脸存储 ----------------
 
     def _locked_image(self) -> Path | None:
-        p = self.face_dir / "locked.png"
-        return p if p.exists() else None
+        for ext in ("png", "jpg", "jpeg", "webp", "bmp"):
+            p = self.face_dir / f"locked.{ext}"
+            if p.exists():
+                return p
+        return None
 
     def _meta_path(self) -> Path:
         return self.face_dir / "face.json"
@@ -246,10 +264,17 @@ class SelfiePlugin(Star):
         except OSError as exc:
             logger.warning(f"[Selfie] 读取锁脸图失败: {exc}")
             return None
-        return "data:image/png;base64," + base64.b64encode(raw).decode()
+        mime = sniff_mime(raw)
+        return f"data:{mime};base64," + base64.b64encode(raw).decode()
 
     def _save_lock(self, src: Path, session_id: str) -> None:
         target = self.face_dir / "locked.png"
+        for old in self.face_dir.glob("locked.*"):
+            if old.suffix != ".json":
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
         target.write_bytes(src.read_bytes())
         meta = {
             "locked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -306,6 +331,19 @@ class SelfiePlugin(Star):
             return str(event.get_session_id())
         except Exception:  # noqa: BLE001
             return "unknown"
+
+    def _extract_images(self, event: AstrMessageEvent) -> list:
+        """取出本条消息里用户上传的图片组件。"""
+        try:
+            chain = getattr(event.message_obj, "message", None)
+        except Exception:  # noqa: BLE001
+            return []
+        if not chain:
+            return []
+        try:
+            return [seg for seg in chain if isinstance(seg, Image)]
+        except Exception:  # noqa: BLE001
+            return []
 
     def _cand_subdir(self, event: AstrMessageEvent) -> Path:
         key = hashlib.md5(self._session_id(event).encode()).hexdigest()[:8]
@@ -563,9 +601,58 @@ class SelfiePlugin(Star):
 
     @filter.command("定脸")
     async def cmd_lock(self, event: AstrMessageEvent, index: int = 0):
-        """锁定角色长相：/定脸 2"""
+        """锁定角色长相：/定脸 2（从候选里选），或直接发一张图 + /定脸"""
+        # 情况一：消息里带图，直接用这张图锁脸
+        imgs = self._extract_images(event)
+        if imgs:
+            try:
+                b64 = await imgs[0].convert_to_base64()
+                raw = base64.b64decode(b64)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[Selfie] 读取上传图片失败: {exc}")
+                yield event.plain_result(f"读取图片失败：{exc}")
+                return
+            if len(raw) < 1024:
+                yield event.plain_result("这张图好像没读完整，换一张试试。")
+                return
+
+            suffix = {"image/jpeg": "jpg", "image/webp": "webp", "image/bmp": "bmp"}.get(
+                sniff_mime(raw), "png"
+            )
+            target = self.face_dir / f"locked.{suffix}"
+            target.write_bytes(raw)
+            # 清掉旧的不同后缀文件，避免读到旧图
+            for old in self.face_dir.glob("locked.*"):
+                if old != target and old.suffix != ".json":
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+
+            meta = {
+                "locked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "session": self._session_id(event),
+                "face": self._load_appearance() or self.character_face,
+                "source": "upload",
+            }
+            self._meta_path().write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+                newline="\n",
+            )
+            logger.info(f"[Selfie] 已用上传图片锁定角色长相（{suffix}，{len(raw)} 字节）")
+            yield event.plain_result(
+                "已用你上传的这张图锁定角色长相。之后换衣服、换场景都会以这张脸为准。",
+            )
+            return
+
+        # 情况二：从候选里按编号选
         if index <= 0:
-            yield event.plain_result("用法：/定脸 编号（先发 /自拍 生成候选）")
+            yield event.plain_result(
+                "两种用法：\n"
+                "· 直接发一张图 + 附上 /定脸 —— 用这张图当角色的脸\n"
+                "· /定脸 编号 —— 从 /自拍 生成的候选里挑一张",
+            )
             return
 
         subdir = self._cand_subdir(event)
