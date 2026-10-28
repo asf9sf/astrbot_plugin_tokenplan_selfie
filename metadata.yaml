@@ -1,0 +1,8 @@
+name: astrbot_plugin_tokenplan_selfie
+display_name: TokenPlan 角色自拍（阿里云百炼）
+desc: 让 AI 用自己的人格身份拍自拍和风景照，支持锁定角色长相，换衣换景始终是同一张脸
+version: v1.0.0
+author: asf9sf
+repo: https://github.com/asf9sf/astrbot_plugin_tokenplan_selfie
+support_platforms:
+  - aiocqhttp

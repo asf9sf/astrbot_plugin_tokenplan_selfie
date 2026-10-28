@@ -1,0 +1,82 @@
+{
+  "api_key": {
+    "description": "Token Plan 套餐 API Key",
+    "type": "string",
+    "default": "",
+    "hint": "以 sk-sp- 开头的套餐密钥，和语音插件可以共用同一个"
+  },
+  "api_base": {
+    "description": "Token Plan 服务地址",
+    "type": "string",
+    "default": "https://token-plan.cn-beijing.maas.aliyuncs.com",
+    "hint": "国内站 cn-beijing，海外站用 https://token-plan.ap-southeast-1.maas.aliyuncs.com"
+  },
+  "model_text2image": {
+    "description": "普通出图模型（不带参考图，最省钱）",
+    "type": "string",
+    "default": "wan2.7-image",
+    "hint": "wan2.7-image 是标准版，价格最低；wan2.7-image-pro 更贵但细节更好；qwen-image-3.0-pro 最贵。风景照和未锁脸时的自拍走这个"
+  },
+  "model_with_reference": {
+    "description": "带参考图模型（锁脸用）",
+    "type": "string",
+    "default": "qwen-image-3.0-pro",
+    "hint": "必须选支持参考图（image_urls）的模型，qwen-image-3.0-pro 的人物身份保持最好。若想更省钱可改 wan2.7-image，但脸的一致性会差一些"
+  },
+  "image_size": {
+    "description": "出图尺寸",
+    "type": "string",
+    "default": "1024*1024",
+    "hint": "格式 宽*高，支持 512*512 ~ 2048*2048。自拍用 1024*1536 竖图更自然，风景用 1024*1024"
+  },
+  "character_face": {
+    "description": "角色固定外貌描述（锁脸的文字部分）",
+    "type": "string",
+    "default": "一位年轻女性，黑色长发，琥珀色眼睛，皮肤白皙，五官清秀",
+    "hint": "越具体越稳定：发色发型、瞳色、脸型、肤色、标志性特征（泪痣/耳钉/痣的位置）。这段话会出现在每一张自拍的提示词里"
+  },
+  "selfie_style": {
+    "description": "统一风格补充词",
+    "type": "string",
+    "default": "",
+    "hint": "可选。例如「日系胶片感，略带颗粒」「午后暖色调，浅景深」。留空则用默认真实照片质感"
+  },
+  "candidate_count": {
+    "description": "每次 /自拍 生成几张候选",
+    "type": "int",
+    "default": 4,
+    "hint": "建议 4。每张都是一次独立计费，越多越贵"
+  },
+  "max_prompt_chars": {
+    "description": "单个描述字段的字数上限",
+    "type": "int",
+    "default": 120
+  },
+  "cooldown": {
+    "description": "同一会话冷却秒数",
+    "type": "int",
+    "default": 10,
+    "hint": "生成一张要十几秒，冷却能防止刷屏把额度烧光"
+  },
+  "enable_tool": {
+    "description": "启用 LLM 工具（AI 自主拍照）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后需要在人格设置里勾选 take_selfie 和 take_photo 两个工具"
+  },
+  "inject_prompt": {
+    "description": "向 LLM 注入拍照能力提示",
+    "type": "bool",
+    "default": true
+  },
+  "keep_candidates": {
+    "description": "候选图最多保留张数",
+    "type": "int",
+    "default": 60
+  },
+  "timeout": {
+    "description": "生图请求超时（秒）",
+    "type": "int",
+    "default": 180
+  }
+}
