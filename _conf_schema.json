@@ -1,15 +1,15 @@
 {
   "api_key": {
-    "description": "Token Plan 套餐 API Key",
+    "description": "API Key",
     "type": "string",
     "default": "",
-    "hint": "以 sk-sp- 开头的套餐密钥，和语音插件可以共用同一个"
+    "hint": "Token Plan 套餐用 sk-sp- 开头的密钥；改用普通百炼业务空间时填该空间的普通 API Key（sk- 开头），和语音插件可共用"
   },
   "api_base": {
-    "description": "Token Plan 服务地址",
+    "description": "服务地址",
     "type": "string",
     "default": "https://token-plan.cn-beijing.maas.aliyuncs.com",
-    "hint": "国内站 cn-beijing，海外站用 https://token-plan.ap-southeast-1.maas.aliyuncs.com"
+    "hint": "三种填法：①套餐默认 https://token-plan.cn-beijing.maas.aliyuncs.com；②业务空间根地址 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com；③业务空间 OpenAI 兼容地址 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1 —— 带 compatible-mode 时自动走 /images/generations，失败会回退原生接口"
   },
   "model_text2image": {
     "description": "普通出图模型（不带参考图，最省钱）",

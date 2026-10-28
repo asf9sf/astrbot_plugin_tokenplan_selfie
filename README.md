@@ -98,6 +98,22 @@ data/plugin_data/astrbot_plugin_tokenplan_selfie/face/
 
 一次 `/自拍` 出 4 张候选 = 0.8 元。锁定后每张 0.2 元，改 pro 则 0.5 元。
 
+### 换成百炼业务空间（用套餐以外的模型）
+
+把「服务地址」改成业务空间地址即可，插件会自动识别协议：
+
+| 填法 | 走的协议 |
+| --- | --- |
+| `https://token-plan.cn-beijing.maas.aliyuncs.com` | DashScope 原生接口（套餐默认） |
+| `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com` | DashScope 原生接口 |
+| `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1` | **OpenAI 兼容协议** `/images/generations` |
+
+判定规则：**地址里带 `compatible-mode` 就走 OpenAI 协议，否则走原生接口。**
+
+OpenAI 协议下图生图用 `image` 字段传参考图（数组），失败会自动回退到同一空间的原生接口。
+
+改用业务空间后，API Key 要换成该空间的普通 Key（`sk-` 开头），不是套餐密钥（`sk-sp-` 开头）。
+
 ## 配置
 
 | 面板名称 | 默认 | 说明 |

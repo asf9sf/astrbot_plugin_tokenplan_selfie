@@ -46,6 +46,23 @@ def _extract_images(body: dict[str, Any]) -> list[str]:
     return urls
 
 
+def _extract_openai_images(body: dict[str, Any]) -> list[str]:
+    """OpenAI 兼容协议的响应：{"data": [{"url": ...} 或 {"b64_json": ...}]}"""
+    out: list[str] = []
+    if not isinstance(body, dict):
+        return out
+    for item in body.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if url:
+            out.append(str(url))
+        b64 = item.get("b64_json")
+        if b64:
+            out.append("data:image/png;base64," + str(b64))
+    return out
+
+
 def _b64_to_bytes(value: str) -> bytes | None:
     """兼容 data URI 形式的 base64 图片。"""
     if not value:
@@ -96,6 +113,27 @@ class TokenPlanImageClient:
 
     # ------------------------------------------------------------------
 
+    @property
+    def is_openai_compat(self) -> bool:
+        """base_url 里带 compatible-mode 就按 OpenAI 协议走，否则走 DashScope 原生接口。"""
+        return "/compatible-mode" in self.api_base.lower()
+
+    @property
+    def openai_endpoint(self) -> str:
+        return self.api_base.rstrip("/") + "/images/generations"
+
+    @property
+    def native_base(self) -> str:
+        """从 OpenAI 兼容地址倒推业务空间根地址，用于失败回退。"""
+        base = self.api_base.rstrip("/")
+        idx = base.lower().find("/compatible-mode")
+        return base[:idx] if idx > 0 else base
+
+    @property
+    def openai_size(self) -> str:
+        # 原生接口用 1024*1024，OpenAI 兼容协议用 1024x1024
+        return (self.size or "1024*1024").replace("*", "x")
+
     def _build_payload(self, prompt: str, reference_b64: str | None, model: str) -> dict:
         content: list[dict[str, Any]] = []
         if reference_b64:
@@ -108,6 +146,75 @@ class TokenPlanImageClient:
             "input": {"messages": [{"role": "user", "content": content}]},
             "parameters": {"size": self.size},
         }
+
+    def _build_openai_payload(
+        self,
+        prompt: str,
+        reference_b64: str | None,
+        model: str,
+    ) -> dict:
+        payload: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "size": self.openai_size,
+            "n": 1,
+        }
+        if reference_b64:
+            # OpenAI 兼容协议的图生图走 image 字段，可传 URL 或 base64
+            payload["image"] = [reference_b64]
+        return payload
+
+    async def _post(self, url: str, payload: dict) -> dict[str, Any]:
+        session = self._ensure_session()
+        async with session.post(
+            url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+        ) as resp:
+            raw = await resp.read()
+            text = raw.decode("utf-8", errors="ignore")
+            if resp.status != 200:
+                raise ImageError(f"生图接口返回 {resp.status}: {text[:300]}")
+            import json as _json
+
+            try:
+                body = _json.loads(text)
+            except Exception as exc:  # noqa: BLE001
+                raise ImageError(f"生图响应不是 JSON: {text[:300]}") from exc
+            if isinstance(body, dict) and body.get("code"):
+                raise ImageError(f"{body.get('code')}: {body.get('message', '')}"[:300])
+            return body
+
+    async def _call_native(
+        self,
+        prompt: str,
+        reference_b64: str | None,
+        model: str,
+    ) -> str:
+        url = self.native_base.rstrip("/") + ENDPOINT_PATH
+        body = await self._post(url, self._build_payload(prompt, reference_b64, model))
+        urls = _extract_images(body)
+        if not urls:
+            raise ImageError(f"响应里没有图片: {str(body)[:300]}")
+        return urls[0]
+
+    async def _call_openai(
+        self,
+        prompt: str,
+        reference_b64: str | None,
+        model: str,
+    ) -> str:
+        body = await self._post(
+            self.openai_endpoint,
+            self._build_openai_payload(prompt, reference_b64, model),
+        )
+        urls = _extract_openai_images(body)
+        if not urls:
+            raise ImageError(f"响应里没有图片: {str(body)[:300]}")
+        return urls[0]
 
     async def generate_one(
         self,
@@ -130,43 +237,23 @@ class TokenPlanImageClient:
         ref = reference_b64 if use_reference else None
         chosen = model or (self.model_i2i if ref else self.model_t2i)
 
-        async def _call(payload: dict) -> str:
-            session = self._ensure_session()
-            async with session.post(
-                self.endpoint,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-            ) as resp:
-                raw = await resp.read()
-                text = raw.decode("utf-8", errors="ignore")
-                if resp.status != 200:
-                    raise ImageError(f"生图接口返回 {resp.status}: {text[:300]}")
-                import json as _json
-
+        async def _call(p: str, r: str | None, m: str) -> str:
+            # base_url 指向业务空间的 /compatible-mode/v1 时先走 OpenAI 协议
+            if self.is_openai_compat:
                 try:
-                    body = _json.loads(text)
-                except Exception as exc:  # noqa: BLE001
-                    raise ImageError(f"生图响应不是 JSON: {text[:300]}") from exc
-                if body.get("code"):
-                    raise ImageError(
-                        f"{body.get('code')}: {body.get('message', '')}"[:300],
-                    )
-                urls = _extract_images(body)
-                if not urls:
-                    raise ImageError(f"响应里没有图片: {text[:300]}")
-                return urls[0]
+                    return await self._call_openai(p, r, m)
+                except ImageError as exc:
+                    logger.warning(f"[Selfie] OpenAI 兼容端点失败，回退原生接口: {exc}")
+            return await self._call_native(p, r, m)
 
         try:
-            url = await _call(self._build_payload(prompt, ref, chosen))
+            url = await _call(prompt, ref, chosen)
             return url, bool(ref)
         except ImageError as exc:
             # 带了参考图却失败，降级为纯文本生成，至少能出图
             if ref:
                 logger.warning(f"[Selfie] 参考图模式失败，降级为纯文本：{exc}")
-                url = await _call(self._build_payload(prompt, None, self.model_t2i))
+                url = await _call(prompt, None, self.model_t2i)
                 return url, False
             raise
 
