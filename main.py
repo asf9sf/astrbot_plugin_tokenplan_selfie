@@ -74,10 +74,10 @@ REAL_IMPERFECTIONS = (
     "构图不在正中，人物偏左或偏右，有一点歪",
 )
 
-REAL_SUFFIX = (
-    "真实手机随手拍，非精修、非 AI 绘画，允许不完美："
-    "不要塑料感皮肤、不要过度磨皮、不要完美对称的构图、不要影棚打光"
-)
+REAL_SUFFIX = "真实手机随手拍，不是样片也不是摆拍，非精修、非 AI 绘图"
+
+# 只在开启「皮肤/服饰瑕疵」时才追加，默认不加，避免把脸画脏
+REAL_SKIN_SUFFIX = "不要塑料感皮肤、不要过度磨皮"
 
 # ---- 真实感：环境 ----
 # AI 生成的背景是「被设计过的」：白墙、一盆绿植、大面积柔焦。
@@ -206,8 +206,10 @@ class SelfiePlugin(Star):
         self.keep_candidates: int = int(cfg("keep_candidates", 60) or 60)
         self.face_from_persona: bool = bool(cfg("face_from_persona", True))
         self.appearance_hint: str = str(cfg("appearance_hint", "") or "").strip()
-        # 真实感档位：0 关闭，1-4 表示每张图塞几条「不完美」细节
+        # 环境真实感：控制背景的生活空间、光源、禁止人像虚化
         self.realism: int = int(cfg("realism", 3) or 0)
+        # 皮肤/服饰瑕疵：单独一档，默认关闭——脸本身已经够好，不需要画毛孔
+        self.detail_defects: int = int(cfg("detail_defects", 0) or 0)
         # 主动发图
         self.proactive_photo: bool = bool(cfg("proactive_photo", True))
         self.daily_limit: int = int(cfg("daily_limit", 1) or 1)
@@ -584,12 +586,15 @@ class SelfiePlugin(Star):
             parts.append(self.selfie_style)
         # 拍摄方式：优先用调用方指定的角度，否则随机一个真实手机自拍姿势
         parts.append(angle or random.choice(REAL_PHONE_SHOTS))
-        # 注入「不完美」细节——这是让画面摆脱 AI 感的关键
+        # 环境层：背景要清晰、有生活痕迹，这是摆脱「样板间感」的关键
         if self.realism > 0:
-            k = min(self.realism, len(REAL_IMPERFECTIONS))
-            parts.extend(random.sample(REAL_IMPERFECTIONS, k))
             parts.append(NO_PORTRAIT_BLUR)
             parts.append(REAL_SUFFIX)
+        # 皮肤/服饰瑕疵是单独一档，默认不动脸
+        if self.detail_defects > 0:
+            k = min(self.detail_defects, len(REAL_IMPERFECTIONS))
+            parts.extend(random.sample(REAL_IMPERFECTIONS, k))
+            parts.append(REAL_SKIN_SUFFIX)
         return "，".join(parts)
 
     def _photo_prompt(self, scene: str) -> str:
@@ -598,9 +603,8 @@ class SelfiePlugin(Star):
             parts.append(self.selfie_style)
         parts.append(random.choice(REAL_PHOTO_SHOTS))
         if self.realism > 0:
-            k = min(self.realism, len(REAL_IMPERFECTIONS))
-            parts.extend(random.sample(REAL_IMPERFECTIONS, k))
             parts.append("自然光，有明确的明暗方向，不是均匀打光")
+            parts.append("背景里能看到具体的物件和细节，不是空旷的样板间")
             parts.append(REAL_SUFFIX)
         parts.append("画面里没有人物")
         return "，".join(parts)
