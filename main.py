@@ -56,7 +56,7 @@ REAL_PHONE_SHOTS = (
     "对着镜子自拍，手机挡住下半张脸，镜面有淡淡反光和一点指纹",
     "前置自拍，镜头离脸很近，一只眼睛略微失焦，另一只清晰",
     "稍微低角度的前置自拍，下巴线条显圆，肩膀有点耸",
-    "侧后方光线下自拍，半边脸在阴影里，脸型不对称",
+    "轻微侧脸角度自拍，脸型看起来不太对称，一边脸颊更明显",
 )
 
 REAL_IMPERFECTIONS = (
@@ -78,6 +78,43 @@ REAL_SUFFIX = (
     "真实手机随手拍，非精修、非 AI 绘画，允许不完美："
     "不要塑料感皮肤、不要过度磨皮、不要完美对称的构图、不要影棚打光"
 )
+
+# ---- 真实感：环境 ----
+# AI 生成的背景是「被设计过的」：白墙、一盆绿植、大面积柔焦。
+# 真实背景是「被生活堆出来的」：插座、外卖盒、没叠的衣服、卷边的贴纸。
+REAL_ENVIRONMENTS = (
+    "出租屋的小卧室，床边堆着没叠的衣服，床头柜上有纸巾盒和半杯水",
+    "老小区的厨房门口，灶台上放着刚洗的碗，墙上那张贴纸已经卷边了",
+    "客厅沙发一角，茶几上摊着外卖盒、充电线和遥控器",
+    "书桌前，桌上摊着笔记本、几支笔和一个吃了一半的橘子",
+    "阳台门口，身后晾着衣服，地上有塑料盆和一双拖鞋",
+    "便利店的货架前，身后是摆得整整齐齐的零食和饮料冰柜",
+    "地铁车厢角落，背景是扶手杆和邻座乘客的半个背影",
+    "奶茶店靠窗的座位，桌上有没喝完的杯子、揉皱的纸巾和手机",
+    "宿舍上床下桌，身后挂着毛巾，书架上贴满便签",
+    "卧室床边，衣柜门半开着，能看到里面塞得有点乱的衣架",
+)
+
+REAL_TRACES = (
+    "背景里有没收拾的生活用品，摆放得很随意",
+    "墙上有插座、开关或者贴着的东西，不是一面白墙",
+    "桌面和台面上堆着杂物，不是干净摆拍",
+    "角落里能看到垃圾桶、纸箱或者塑料袋",
+    "有一两件东西明显没摆正，歪着",
+)
+
+REAL_LIGHTING = (
+    "只有窗外一侧的光，脸的一侧亮一侧暗，背景靠里的角落是暗的",
+    "头顶日光灯偏白，脸上光很平，下巴有硬阴影",
+    "台灯的暖光和窗外进来的冷光混着，色温不统一",
+    "手机屏幕的光打在脸上，背景明显更暗",
+    "傍晚的光，整体偏橙，影子被拉得很长",
+    "阴天的散射光，没有明显影子，但整体偏灰",
+)
+
+# 手机前置摄像头传感器小、又是广角，景深很大，背景其实不会糊。
+# AI 图经常把人像模式的强虚化塞进来，这是「一眼 AI」的重要来源之一。
+NO_PORTRAIT_BLUR = "背景清晰可辨，能看到具体的物件和空间关系，不要人像模式虚化、不要整片糊掉的散景"
 
 # 风景 / 环境照用主摄视角
 REAL_PHOTO_SHOTS = (
@@ -531,8 +568,16 @@ class SelfiePlugin(Star):
         parts = [self._base_face()]
         if outfit:
             parts.append(f"穿着{outfit}")
+        # 环境：AI 会把背景画成样板间（白墙+绿植+大面积柔焦），
+        # 所以要么给一整个「被生活堆出来的」具体空间，要么在给定场景上补一条生活痕迹。
         if scene:
-            parts.append(f"身处{scene}")
+            parts.append(f"在{scene}")
+            if self.realism > 0:
+                parts.append(random.choice(REAL_TRACES))
+        elif self.realism > 0:
+            parts.append(f"在{random.choice(REAL_ENVIRONMENTS)}")
+        if self.realism > 0:
+            parts.append(random.choice(REAL_LIGHTING))
         if mood:
             parts.append(f"神态{mood}")
         if self.selfie_style:
@@ -543,6 +588,7 @@ class SelfiePlugin(Star):
         if self.realism > 0:
             k = min(self.realism, len(REAL_IMPERFECTIONS))
             parts.extend(random.sample(REAL_IMPERFECTIONS, k))
+            parts.append(NO_PORTRAIT_BLUR)
             parts.append(REAL_SUFFIX)
         return "，".join(parts)
 
@@ -554,6 +600,7 @@ class SelfiePlugin(Star):
         if self.realism > 0:
             k = min(self.realism, len(REAL_IMPERFECTIONS))
             parts.extend(random.sample(REAL_IMPERFECTIONS, k))
+            parts.append("自然光，有明确的明暗方向，不是均匀打光")
             parts.append(REAL_SUFFIX)
         parts.append("画面里没有人物")
         return "，".join(parts)
