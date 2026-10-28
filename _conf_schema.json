@@ -29,6 +29,12 @@
     "default": "1024*1024",
     "hint": "格式 宽*高，支持 512*512 ~ 2048*2048。自拍用 1024*1536 竖图更自然，风景用 1024*1024"
   },
+  "realism": {
+    "description": "真实感强度（0-4）",
+    "type": "int",
+    "default": 3,
+    "hint": "每张图随机塞入几条「不完美」细节：毛孔、碎发、构图歪、噪点、背景杂物。0 关闭会让画面立刻回到 AI 感，建议 2-4"
+  },
   "face_from_persona": {
     "description": "由人设自动生成外貌描述",
     "type": "bool",
@@ -85,6 +91,36 @@
     "description": "候选图最多保留张数",
     "type": "int",
     "default": 60
+  },
+  "proactive_photo": {
+    "description": "启用主动发图",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后角色会在一天里的随机时刻，自己拍一张发给最近聊过天的会话。关闭则只能由用户要求才拍"
+  },
+  "daily_limit": {
+    "description": "每天最多主动发几张",
+    "type": "int",
+    "default": 1,
+    "hint": "建议 1。照片是有成本的（每张 0.2 元起），而且发多了就不珍贵了。用户主动要求的不受这个限制"
+  },
+  "quiet_hours": {
+    "description": "静默时段",
+    "type": "string",
+    "default": "0-8",
+    "hint": "格式 起始小时-结束小时，24 小时制。凌晨不打扰。填 0-0 表示不限制"
+  },
+  "active_hours": {
+    "description": "活跃判定时长（小时）",
+    "type": "float",
+    "default": 24,
+    "hint": "只给最近这么多小时内说过话的会话发图，冷掉的会话不打扰"
+  },
+  "check_interval_minutes": {
+    "description": "后台检查间隔（分钟）",
+    "type": "int",
+    "default": 20,
+    "hint": "多久看一眼该不该发图。实际发送时刻是当天随机挑的，不是准时发"
   },
   "timeout": {
     "description": "生图请求超时（秒）",

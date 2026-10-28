@@ -8,10 +8,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
+import random
+import re
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from astrbot.api import logger
@@ -41,6 +45,74 @@ SELFIE_ANGLES = (
     "户外随手自拍，背景轻微虚化，自然日光",
     "低头看镜头的特写自拍，顶光，情绪感强",
 )
+
+# ---- 真实感：手机前置的物理特征 ----
+# AI 图之所以一眼假，是因为太完美、太居中、光影太均匀。
+# 这几组片段负责把「手机随手拍」的缺陷和物理特性塞回去。
+REAL_PHONE_SHOTS = (
+    "手机前置摄像头近距自拍，24mm 广角，鼻子和额头因广角略被拉大，画面边缘有轻微形变",
+    "手机前置自拍，微微仰角，下巴和脖子有自然阴影，边缘轻微拉伸",
+    "手持自拍，一只手入镜拿着手机，构图有点歪，不在正中",
+    "对着镜子自拍，手机挡住下半张脸，镜面有淡淡反光和一点指纹",
+    "前置自拍，镜头离脸很近，一只眼睛略微失焦，另一只清晰",
+    "稍微低角度的前置自拍，下巴线条显圆，肩膀有点耸",
+    "侧后方光线下自拍，半边脸在阴影里，脸型不对称",
+)
+
+REAL_IMPERFECTIONS = (
+    "皮肤有毛孔和细小瑕疵，鼻翼微微泛油光，不是磨皮效果",
+    "头发有几缕不听话的碎发翘着，没有全部服帖",
+    "脸颊有一点点不均匀的泛红，左右不对称",
+    "眼睛下方有轻微的黑眼圈和眼袋",
+    "嘴唇略干，能看到一点唇纹",
+    "衣领有点皱，肩线不完全对称",
+    "背景里有生活杂物：充电线、水杯、纸巾盒之类",
+    "画面有轻微噪点，白平衡偏暖，不是影棚色温",
+    "背光处有一点点过曝，高光溢出但没修",
+    "右下角有一点镜头雾感，像镜头上沾了指纹",
+    "背景虚化不彻底，能看出远处物体的轮廓",
+    "构图不在正中，人物偏左或偏右，有一点歪",
+)
+
+REAL_SUFFIX = (
+    "真实手机随手拍，非精修、非 AI 绘画，允许不完美："
+    "不要塑料感皮肤、不要过度磨皮、不要完美对称的构图、不要影棚打光"
+)
+
+# 风景 / 环境照用主摄视角
+REAL_PHOTO_SHOTS = (
+    "手机主摄随手拍，构图不刻意，地平线略微倾斜",
+    "手持手机拍摄，有轻微的抖动模糊",
+    "手机广角拍摄，画面边缘轻微畸变",
+    "随手一拍，主体不在正中央，边上有杂物入镜",
+    "隔着玻璃拍的，有一点反光和眩光",
+)
+
+
+_JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
+
+
+def extract_json(text: str):
+    """从可能带解释或代码块的回复里抠出 JSON。"""
+    if not text:
+        return None
+    m = _JSON_BLOCK.search(text)
+    if m:
+        text = m.group(1)
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:  # noqa: BLE001
+        pass
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        end = text.rfind(closer)
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except Exception:  # noqa: BLE001
+                continue
+    return None
 
 
 def sniff_mime(raw: bytes) -> str:
@@ -97,6 +169,14 @@ class SelfiePlugin(Star):
         self.keep_candidates: int = int(cfg("keep_candidates", 60) or 60)
         self.face_from_persona: bool = bool(cfg("face_from_persona", True))
         self.appearance_hint: str = str(cfg("appearance_hint", "") or "").strip()
+        # 真实感档位：0 关闭，1-4 表示每张图塞几条「不完美」细节
+        self.realism: int = int(cfg("realism", 3) or 0)
+        # 主动发图
+        self.proactive_photo: bool = bool(cfg("proactive_photo", True))
+        self.daily_limit: int = int(cfg("daily_limit", 1) or 1)
+        self.quiet_hours: str = str(cfg("quiet_hours", "0-8") or "")
+        self.active_hours: float = float(cfg("active_hours", 24) or 24)
+        self.check_interval: int = int(cfg("check_interval_minutes", 20) or 20)
 
         self.client = TokenPlanImageClient(
             api_key=self.api_key,
@@ -117,19 +197,121 @@ class SelfiePlugin(Star):
         self.face_dir.mkdir(parents=True, exist_ok=True)
         self.cand_dir.mkdir(parents=True, exist_ok=True)
 
+        self.state_path = data_dir / "state.json"
+        self.state: dict = self._load_state()
+
         self._last_call: dict[str, float] = {}
         # 每轮 LLM 请求时缓存当前人格，供「人设 → 外貌描述」使用
         self._persona_cache: dict[str, str] = {}
+        self._task: asyncio.Task | None = None
+        self._busy = False
 
         locked = self._locked_image()
         logger.info(
             f"[Selfie] 已加载：文生图={self.client.model_t2i} "
             f"参考图={self.client.model_i2i} 尺寸={self.client.size} "
-            f"锁脸={'已锁定' if locked else '未锁定'} 工具={'开' if self.enable_tool else '关'}",
+            f"真实感={self.realism} 锁脸={'已锁定' if locked else '未锁定'} "
+            f"主动发图={'开' if self.proactive_photo else '关'} "
+            f"工具={'开' if self.enable_tool else '关'}",
         )
 
+    async def initialize(self) -> None:
+        if self.proactive_photo:
+            self._task = asyncio.create_task(self._proactive_loop())
+
     async def terminate(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
         await self.client.close()
+
+    # ---------------- 会话状态 ----------------
+
+    def _load_state(self) -> dict:
+        default = {"sessions": {}, "photo_date": "", "photo_count": 0}
+        try:
+            if self.state_path.exists():
+                data = json.loads(self.state_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    for k, v in default.items():
+                        data.setdefault(k, v)
+                    return data
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Selfie] 读取状态失败: {exc}")
+        return default
+
+    def _save_state(self) -> None:
+        try:
+            self.state_path.write_text(
+                json.dumps(self.state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+                newline="\n",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Selfie] 保存状态失败: {exc}")
+
+    def _session(self, umo: str) -> dict:
+        return self.state["sessions"].setdefault(
+            umo, {"enabled": True, "last_active": 0, "next_photo_at": 0}
+        )
+
+    def _touch(self, umo: str) -> None:
+        try:
+            sess = self._session(umo)
+            now = time.time()
+            if now - float(sess.get("last_active", 0)) < 60:
+                return
+            sess["last_active"] = now
+            self._save_state()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _in_quiet_hours(self) -> bool:
+        raw = (self.quiet_hours or "").strip()
+        if not raw or "-" not in raw:
+            return False
+        try:
+            a, b = raw.split("-", 1)
+            start, end = int(a), int(b)
+        except ValueError:
+            return False
+        if start == end:
+            return False
+        hour = datetime.now().hour
+        if start < end:
+            return start <= hour < end
+        return hour >= start or hour < end
+
+    def _today(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _count_today(self) -> int:
+        return self.state.get("photo_count", 0) if self.state.get("photo_date") == self._today() else 0
+
+    def _plan_next_photo(self) -> float:
+        """在今天允许的时段里随机挑一个时刻，让主动发图不显得像定时任务。"""
+        now = datetime.now()
+        start_h = 8
+        end_h = 23
+        raw = (self.quiet_hours or "").strip()
+        if raw and "-" in raw:
+            try:
+                a, b = raw.split("-", 1)
+                start_h = max(int(b), 8) if int(a) == 0 else 8
+                end_h = 23
+            except ValueError:
+                pass
+        if now.hour >= end_h:
+            # 今天窗口已过，安排到明天开场
+            return (
+                datetime(now.year, now.month, now.day) + timedelta(days=1)
+            ).replace(hour=start_h, minute=random.randint(0, 40)).timestamp()
+
+        lo = max(now.hour, start_h)
+        target_h = random.randint(lo, end_h - 1)
+        target_m = random.randint(0, 59)
+        if target_h == now.hour and target_m <= now.minute:
+            target_m = min(59, now.minute + random.randint(5, 40))
+        return now.replace(hour=target_h, minute=target_m, second=0, microsecond=0).timestamp()
 
     # ---------------- 锁脸存储 ----------------
 
@@ -237,10 +419,13 @@ class SelfiePlugin(Star):
                     return item.strip()
         return ""
 
-    def _persona_text(self, event: AstrMessageEvent) -> str:
-        return self._persona_cache.get(self._session_id(event), "") or self._persona_from_config()
+    def _persona_text_umo(self, umo: str) -> str:
+        return self._persona_cache.get(umo, "") or self._persona_from_config()
 
-    async def _ensure_appearance(self, event: AstrMessageEvent) -> str:
+    def _persona_text(self, event: AstrMessageEvent) -> str:
+        return self._persona_text_umo(self._session_id(event))
+
+    async def _ensure_appearance_umo(self, umo: str) -> str:
         """拿一段固定的外貌描述：已有缓存直接用，否则按人设总结一次并存下来。"""
         cached = self._load_appearance()
         if cached:
@@ -248,12 +433,15 @@ class SelfiePlugin(Star):
 
         text = ""
         if self.face_from_persona:
-            text = await self._summarize_appearance(self._persona_text(event))
+            text = await self._summarize_appearance(self._persona_text_umo(umo))
         if not text:
             text = self.character_face
         self._save_appearance(text)
         logger.info(f"[Selfie] 已生成外貌描述：{text[:60]}…")
         return text
+
+    async def _ensure_appearance(self, event: AstrMessageEvent) -> str:
+        return await self._ensure_appearance_umo(self._session_id(event))
 
     def _load_reference_b64(self) -> str | None:
         p = self._locked_image()
@@ -349,14 +537,25 @@ class SelfiePlugin(Star):
             parts.append(f"神态{mood}")
         if self.selfie_style:
             parts.append(self.selfie_style)
-        parts.append(angle or "手机前置摄像头自拍，近距离半身构图，自然光，真实照片质感，生活照")
+        # 拍摄方式：优先用调用方指定的角度，否则随机一个真实手机自拍姿势
+        parts.append(angle or random.choice(REAL_PHONE_SHOTS))
+        # 注入「不完美」细节——这是让画面摆脱 AI 感的关键
+        if self.realism > 0:
+            k = min(self.realism, len(REAL_IMPERFECTIONS))
+            parts.extend(random.sample(REAL_IMPERFECTIONS, k))
+            parts.append(REAL_SUFFIX)
         return "，".join(parts)
 
     def _photo_prompt(self, scene: str) -> str:
         parts = [scene or "一处风景"]
         if self.selfie_style:
             parts.append(self.selfie_style)
-        parts.append("第一人称视角随手拍，真实照片质感，高清细节，无人物")
+        parts.append(random.choice(REAL_PHOTO_SHOTS))
+        if self.realism > 0:
+            k = min(self.realism, len(REAL_IMPERFECTIONS))
+            parts.extend(random.sample(REAL_IMPERFECTIONS, k))
+            parts.append(REAL_SUFFIX)
+        parts.append("画面里没有人物")
         return "，".join(parts)
 
     # ---------------- 通用 ----------------
@@ -387,11 +586,14 @@ class SelfiePlugin(Star):
         except Exception:  # noqa: BLE001
             return []
 
-    def _cand_subdir(self, event: AstrMessageEvent) -> Path:
-        key = hashlib.md5(self._session_id(event).encode()).hexdigest()[:8]
+    def _cand_dir_umo(self, umo: str) -> Path:
+        key = hashlib.md5(umo.encode()).hexdigest()[:8]
         d = self.cand_dir / key
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def _cand_subdir(self, event: AstrMessageEvent) -> Path:
+        return self._cand_dir_umo(self._session_id(event))
 
     def _in_cooldown(self, event: AstrMessageEvent) -> bool:
         if self.cooldown <= 0:
@@ -413,6 +615,154 @@ class SelfiePlugin(Star):
                 f.unlink()
             except OSError:
                 pass
+
+    # ---------------- 主动发图 ----------------
+
+    async def _proactive_loop(self) -> None:
+        await asyncio.sleep(120)
+        while True:
+            try:
+                await self._tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"[Selfie] 主动发图检查出错: {exc}")
+            await asyncio.sleep(max(5, self.check_interval) * 60)
+
+    async def _tick(self) -> None:
+        if not self.proactive_photo or self._busy:
+            return
+        if self._in_quiet_hours():
+            return
+        if self._count_today() >= self.daily_limit:
+            return
+        # 没锁脸时主动发图没意义，脸会飘，等用户先定脸
+        if not self._locked_image():
+            return
+
+        now_ts = time.time()
+        targets = []
+        planned = False
+        for umo, sess in list(self.state.get("sessions", {}).items()):
+            if not sess.get("enabled", True):
+                continue
+            if now_ts - float(sess.get("last_active", 0)) > self.active_hours * 3600:
+                continue
+            nxt = float(sess.get("next_photo_at") or 0)
+            if not nxt:
+                # 新会话先排一个当天的随机时刻，别一装完就立刻发
+                sess["next_photo_at"] = self._plan_next_photo()
+                planned = True
+                continue
+            if nxt <= now_ts:
+                targets.append(umo)
+
+        if planned:
+            self._save_state()
+        if not targets:
+            return
+
+        umo = random.choice(targets)
+        self._busy = True
+        try:
+            await self._proactive_send(umo)
+        finally:
+            self._busy = False
+            today = self._today()
+            if self.state.get("photo_date") != today:
+                self.state["photo_date"] = today
+                self.state["photo_count"] = 0
+            self.state["photo_count"] = int(self.state.get("photo_count", 0)) + 1
+            self._session(umo)["next_photo_at"] = self._plan_next_photo()
+            self._save_state()
+
+    async def _imagine_scene(self, umo: str) -> tuple[str, str, str]:
+        """让角色自己想一个「此刻发给你看」的画面。"""
+        try:
+            provider = self.context.get_using_provider()
+        except Exception:  # noqa: BLE001
+            provider = None
+
+        fallback = ("房间的窗边", "居家的衣服", "放松")
+        if not provider:
+            return fallback
+
+        persona = self._persona_text_umo(umo)[:800]
+        hour = datetime.now().hour
+        if hour < 11:
+            phase = "早上"
+        elif hour < 14:
+            phase = "中午"
+        elif hour < 18:
+            phase = "下午"
+        elif hour < 23:
+            phase = "晚上"
+        else:
+            phase = "深夜"
+
+        prompt = (
+            f"你的人设：{persona or '（普通年轻人）'}\n"
+            f"现在是{phase}。你想给 ta 随手发一张自拍。\n"
+            "想一个此刻真实可信的画面：你在哪、穿着什么、什么表情。"
+            "要贴合人设和时间，不要每次都是咖啡厅，也可以在家、在路上、在便利店、在教室。\n"
+            '只输出 JSON：{"scene":"场景，15字内","outfit":"穿着，15字内","mood":"神态，10字内"}'
+        )
+        try:
+            resp = await provider.text_chat(
+                prompt=prompt,
+                contexts=[],
+                system_prompt="只输出 JSON，不要任何解释。",
+            )
+            data = extract_json(getattr(resp, "completion_text", "") or "")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Selfie] 想象场景失败: {exc}")
+            data = None
+
+        if isinstance(data, dict):
+            return (
+                str(data.get("scene") or "")[:30],
+                str(data.get("outfit") or "")[:30],
+                str(data.get("mood") or "")[:20],
+            )
+        return fallback
+
+    async def _generate_images(self, prompts: list[str], umo: str) -> tuple[list[Path], bool]:
+        ref = self._load_reference_b64()
+        results = await self.client.generate_many(
+            prompts[0], len(prompts), reference_b64=ref, prompts=prompts
+        )
+        subdir = self._cand_dir_umo(umo)
+        paths: list[Path] = []
+        used_ref = False
+        for url, ur in results:
+            try:
+                paths.append(await self.client.save_image(url, subdir, "selfie"))
+                used_ref = used_ref or ur
+            except ImageError as exc:
+                logger.warning(f"[Selfie] 下载失败: {exc}")
+        return paths, used_ref
+
+    async def _proactive_send(self, umo: str) -> None:
+        await self._ensure_appearance_umo(umo)
+        scene, outfit, mood = await self._imagine_scene(umo)
+        prompt = self._selfie_prompt(scene, outfit, mood)
+        try:
+            paths, _ = await self._generate_images([prompt], umo)
+        except ImageError as exc:
+            logger.warning(f"[Selfie] 主动发图失败: {exc}")
+            return
+        if not paths:
+            return
+        try:
+            ok = await self.context.send_message(
+                umo, MessageChain([Image.fromFileSystem(str(p)) for p in paths])
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[Selfie] 主动发图发送失败: {exc}")
+            return
+        if ok:
+            logger.info(f"[Selfie] 主动发图成功 → {umo}（{scene}）")
+        self._cleanup_candidates()
 
     # ---------------- LLM 工具 ----------------
 
@@ -571,6 +921,9 @@ class SelfiePlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        # 记录活跃，主动发图只发给最近说过话的会话
+        self._touch(self._session_id(event))
+
         # 顺手把当前 system_prompt（内含人格设定）缓存下来，
         # 供「人设 → 外貌描述」使用；即使关闭提示注入也要缓存。
         try:
@@ -796,3 +1149,44 @@ class SelfiePlugin(Star):
         yield event.plain_result("正在根据人设重新总结外貌…")
         text = await self._ensure_appearance(event)
         yield event.plain_result(f"新的外貌描述：\n{text}")
+
+    @filter.command("主动图开")
+    async def cmd_proactive_on(self, event: AstrMessageEvent):
+        """允许角色偶尔主动发照片"""
+        umo = self._session_id(event)
+        self._touch(umo)
+        sess = self._session(umo)
+        sess["enabled"] = True
+        sess["next_photo_at"] = self._plan_next_photo()
+        self._save_state()
+        yield event.plain_result(
+            f"好，我偶尔会随手拍一张发给你（每天最多 {self.daily_limit} 张，不会太频繁）。",
+        )
+
+    @filter.command("主动图关")
+    async def cmd_proactive_off(self, event: AstrMessageEvent):
+        """关闭主动发照片"""
+        umo = self._session_id(event)
+        self._touch(umo)
+        self._session(umo)["enabled"] = False
+        self._save_state()
+        yield event.plain_result("好，我不主动发了。想看就跟我说。")
+
+    @filter.command("主动图状态")
+    async def cmd_proactive_status(self, event: AstrMessageEvent):
+        """查看主动发图的状态"""
+        umo = self._session_id(event)
+        sess = self._session(umo)
+        nxt = float(sess.get("next_photo_at") or 0)
+        now = time.time()
+        if nxt and nxt > now:
+            eta = int((nxt - now) / 60)
+            nxt_txt = f"约 {eta} 分钟后"
+        else:
+            nxt_txt = "待安排"
+        yield event.plain_result(
+            f"主动发图：{'开' if sess.get('enabled', True) else '关'}\n"
+            f"今天已发：{self._count_today()}/{self.daily_limit}\n"
+            f"下一次：{nxt_txt}\n"
+            f"锁脸：{'已锁定' if self._locked_image() else '未锁定（未锁脸不会主动发）'}",
+        )
