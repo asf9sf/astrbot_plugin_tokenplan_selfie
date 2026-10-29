@@ -107,8 +107,8 @@
   "daily_limit": {
     "description": "每天最多主动发几张",
     "type": "int",
-    "default": 1,
-    "hint": "建议 1。照片是有成本的（每张 0.2 元起），而且发多了就不珍贵了。用户主动要求的不受这个限制"
+    "default": 2,
+    "hint": "达到上限后置 exhausted 标记位，当天直接停止主动发图，跨天自动清零。用尽后想看只能由用户主动要求。每张 0.2 元起"
   },
   "quiet_hours": {
     "description": "静默时段",

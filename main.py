@@ -212,7 +212,7 @@ class SelfiePlugin(Star):
         self.detail_defects: int = int(cfg("detail_defects", 0) or 0)
         # 主动发图
         self.proactive_photo: bool = bool(cfg("proactive_photo", True))
-        self.daily_limit: int = int(cfg("daily_limit", 1) or 1)
+        self.daily_limit: int = int(cfg("daily_limit", 2) or 2)
         self.quiet_hours: str = str(cfg("quiet_hours", "0-8") or "")
         self.active_hours: float = float(cfg("active_hours", 24) or 24)
         self.check_interval: int = int(cfg("check_interval_minutes", 20) or 20)
@@ -266,7 +266,7 @@ class SelfiePlugin(Star):
     # ---------------- 会话状态 ----------------
 
     def _load_state(self) -> dict:
-        default = {"sessions": {}, "photo_date": "", "photo_count": 0}
+        default = {"sessions": {}, "quota": {}}
         try:
             if self.state_path.exists():
                 data = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -323,8 +323,46 @@ class SelfiePlugin(Star):
     def _today(self) -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
+    def _quota(self) -> dict:
+        """每日主动发图配额。跨天自动清零，用尽后置 exhausted 标记位。
+
+        结构：{"date": "2026-10-29", "used": 2, "exhausted": true}
+        """
+        today = self._today()
+        q = self.state.get("quota")
+        if not isinstance(q, dict):
+            # 从旧版本结构迁移
+            q = {
+                "date": self.state.get("photo_date") or "",
+                "used": int(self.state.get("photo_count", 0) or 0),
+                "exhausted": False,
+            }
+            self.state["quota"] = q
+        if q.get("date") != today:
+            q["date"] = today
+            q["used"] = 0
+            q["exhausted"] = False
+            self._save_state()
+            logger.info(f"[Selfie] 新的一天（{today}），主动发图配额已重置")
+        return q
+
     def _count_today(self) -> int:
-        return self.state.get("photo_count", 0) if self.state.get("photo_date") == self._today() else 0
+        return int(self._quota().get("used", 0) or 0)
+
+    def _quota_exhausted(self) -> bool:
+        """配额用尽的标记位，True 时当天不再主动发图。"""
+        return bool(self._quota().get("exhausted"))
+
+    def _consume_quota(self) -> None:
+        """成功发出后消耗一张配额，到达上限就置标记位。"""
+        q = self._quota()
+        q["used"] = int(q.get("used", 0) or 0) + 1
+        if q["used"] >= self.daily_limit:
+            q["exhausted"] = True
+            logger.info(
+                f"[Selfie] 今日主动发图已达上限 {self.daily_limit} 张，标记 exhausted，当天不再主动发",
+            )
+        self._save_state()
 
     def _plan_next_photo(self) -> float:
         """在今天允许的时段里随机挑一个时刻，让主动发图不显得像定时任务。"""
@@ -683,9 +721,14 @@ class SelfiePlugin(Star):
     async def _tick(self) -> None:
         if not self.proactive_photo or self._busy:
             return
+        # 配额用尽的标记位——当天直接短路，不再做任何抓取和生成
+        if self._quota_exhausted():
+            return
         if self._in_quiet_hours():
             return
         if self._count_today() >= self.daily_limit:
+            self._quota()["exhausted"] = True
+            self._save_state()
             return
         # 没锁脸时主动发图没意义，脸会飘，等用户先定脸
         if not self._locked_image():
@@ -715,15 +758,14 @@ class SelfiePlugin(Star):
 
         umo = random.choice(targets)
         self._busy = True
+        sent = False
         try:
-            await self._proactive_send(umo)
+            sent = await self._proactive_send(umo)
         finally:
             self._busy = False
-            today = self._today()
-            if self.state.get("photo_date") != today:
-                self.state["photo_date"] = today
-                self.state["photo_count"] = 0
-            self.state["photo_count"] = int(self.state.get("photo_count", 0)) + 1
+            # 只有真正发出去才扣配额
+            if sent:
+                self._consume_quota()
             self._session(umo)["next_photo_at"] = self._plan_next_photo()
             self._save_state()
 
@@ -793,7 +835,8 @@ class SelfiePlugin(Star):
                 logger.warning(f"[Selfie] 下载失败: {exc}")
         return paths, used_ref
 
-    async def _proactive_send(self, umo: str) -> None:
+    async def _proactive_send(self, umo: str) -> bool:
+        """主动拍一张并发出，返回是否真的发成功（成功才扣配额）。"""
         await self._ensure_appearance_umo(umo)
         scene, outfit, mood = await self._imagine_scene(umo)
         prompt = self._selfie_prompt(scene, outfit, mood)
@@ -801,19 +844,20 @@ class SelfiePlugin(Star):
             paths, _ = await self._generate_images([prompt], umo)
         except ImageError as exc:
             logger.warning(f"[Selfie] 主动发图失败: {exc}")
-            return
+            return False
         if not paths:
-            return
+            return False
         try:
             ok = await self.context.send_message(
                 umo, MessageChain([Image.fromFileSystem(str(p)) for p in paths])
             )
         except Exception as exc:  # noqa: BLE001
             logger.error(f"[Selfie] 主动发图发送失败: {exc}")
-            return
+            return False
         if ok:
             logger.info(f"[Selfie] 主动发图成功 → {umo}（{scene}）")
         self._cleanup_candidates()
+        return bool(ok)
 
     # ---------------- LLM 工具 ----------------
 
@@ -1235,9 +1279,11 @@ class SelfiePlugin(Star):
             nxt_txt = f"约 {eta} 分钟后"
         else:
             nxt_txt = "待安排"
+        exhausted = self._quota_exhausted()
         yield event.plain_result(
             f"主动发图：{'开' if sess.get('enabled', True) else '关'}\n"
-            f"今天已发：{self._count_today()}/{self.daily_limit}\n"
-            f"下一次：{nxt_txt}\n"
+            f"今日配额：{self._count_today()}/{self.daily_limit}"
+            f"{'（已用尽，今天不会再发）' if exhausted else ''}\n"
+            f"下一次：{'已停止' if exhausted else nxt_txt}\n"
             f"锁脸：{'已锁定' if self._locked_image() else '未锁定（未锁脸不会主动发）'}",
         )
