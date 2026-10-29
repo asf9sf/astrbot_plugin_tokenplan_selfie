@@ -388,7 +388,9 @@ class SelfiePlugin(Star):
         target_m = random.randint(0, 59)
         if target_h == now.hour and target_m <= now.minute:
             target_m = min(59, now.minute + random.randint(5, 40))
-        return now.replace(hour=target_h, minute=target_m, second=0, microsecond=0).timestamp()
+        ts = now.replace(hour=target_h, minute=target_m, second=0, microsecond=0).timestamp()
+        # 兜底：至少隔 20 分钟，避免刚发完立刻又能触发
+        return max(ts, time.time() + 20 * 60)
 
     # ---------------- 锁脸存储 ----------------
 
@@ -880,7 +882,19 @@ class SelfiePlugin(Star):
             mood(string): 神态表情，如「微微一笑」「害羞低头」「眯眼笑」
         """
         event = unwrap_event(event)
-        yield await self._do_selfie(event, scene, outfit, mood, count=1)
+        # AI 自己决定拍，也算「主动发图」，同样受每日配额约束。
+        # 只有用户明确发的 /自拍 命令不占配额。
+        if self._quota_exhausted():
+            yield (
+                "今天的主动发图额度已经用完了，这次先不拍。"
+                "如果用户想看，让他自己发 /自拍。"
+            )
+            return
+
+        result = await self._do_selfie(event, scene, outfit, mood, count=1)
+        if result.startswith("自拍已发送"):
+            self._consume_quota()
+        yield result
         return
 
     @filter.llm_tool(TOOL_PHOTO)
