@@ -110,6 +110,12 @@
     "default": 2,
     "hint": "达到上限后置 exhausted 标记位，当天直接停止主动发图，跨天自动清零。用尽后想看只能由用户主动要求。每张 0.2 元起"
   },
+  "min_interval_hours": {
+    "description": "两次主动发图的最小间隔（小时）",
+    "type": "float",
+    "default": 4,
+    "hint": "AI 自己主动拍的，两次之间至少隔这么久，0 表示不限制。用户主动要求的不受此限（/自拍 或对话里点名要图都算用户要求）"
+  },
   "quiet_hours": {
     "description": "静默时段",
     "type": "string",

@@ -46,6 +46,20 @@ SELFIE_ANGLES = (
     "低头看镜头的特写自拍，顶光，情绪感强",
 )
 
+# 用户明确要照片的说法：命中就当作「用户要求」，不占配额、不受最小间隔限制
+PHOTO_REQUEST_HINTS = (
+    "自拍",
+    "拍张",
+    "拍一张",
+    "看看你",
+    "看看你的样子",
+    "长什么样",
+    "发张照",
+    "来张",
+    "照一张",
+    "想看你",
+)
+
 # ---- 真实感：手机前置的物理特征 ----
 # AI 图之所以一眼假，是因为太完美、太居中、光影太均匀。
 # 这几组片段负责把「手机随手拍」的缺陷和物理特性塞回去。
@@ -216,6 +230,8 @@ class SelfiePlugin(Star):
         self.quiet_hours: str = str(cfg("quiet_hours", "0-8") or "")
         self.active_hours: float = float(cfg("active_hours", 24) or 24)
         self.check_interval: int = int(cfg("check_interval_minutes", 20) or 20)
+        # 两次「主动发图」之间的最小间隔（小时），用户主动要求的不受此限
+        self.min_interval_hours: float = float(cfg("min_interval_hours", 4) or 0)
 
         self.client = TokenPlanImageClient(
             api_key=self.api_key,
@@ -304,6 +320,18 @@ class SelfiePlugin(Star):
         except Exception:  # noqa: BLE001
             pass
 
+    def _user_asked_for_photo(self, event: AstrMessageEvent) -> bool:
+        """判断用户这一句是不是在明确要照片。"""
+        text = ""
+        try:
+            text = (getattr(event, "message_str", "") or "").strip()
+        except Exception:  # noqa: BLE001
+            return False
+        # 太长的段落多半不是单纯要图，避免误判
+        if not text or len(text) > 60:
+            return False
+        return any(k in text for k in PHOTO_REQUEST_HINTS)
+
     def _in_quiet_hours(self) -> bool:
         raw = (self.quiet_hours or "").strip()
         if not raw or "-" not in raw:
@@ -353,10 +381,27 @@ class SelfiePlugin(Star):
         """配额用尽的标记位，True 时当天不再主动发图。"""
         return bool(self._quota().get("exhausted"))
 
+    def _in_min_interval(self) -> bool:
+        """距上次主动发图是否还不够 min_interval_hours。"""
+        if self.min_interval_hours <= 0:
+            return False
+        last = float(self.state.get("last_push") or 0)
+        if not last:
+            return False
+        gap = time.time() - last
+        if gap < self.min_interval_hours * 3600:
+            logger.info(
+                f"[Selfie] 距上次主动发图仅 {gap / 3600:.1f} 小时，"
+                f"未满 {self.min_interval_hours} 小时，本轮跳过",
+            )
+            return True
+        return False
+
     def _consume_quota(self) -> None:
-        """成功发出后消耗一张配额，到达上限就置标记位。"""
+        """成功发出后消耗一张配额，同时记下时间点用于间隔判断。"""
         q = self._quota()
         q["used"] = int(q.get("used", 0) or 0) + 1
+        self.state["last_push"] = time.time()
         if q["used"] >= self.daily_limit:
             q["exhausted"] = True
             logger.info(
@@ -726,6 +771,9 @@ class SelfiePlugin(Star):
         # 配额用尽的标记位——当天直接短路，不再做任何抓取和生成
         if self._quota_exhausted():
             return
+        # 两次主动之间至少隔 min_interval_hours
+        if self._in_min_interval():
+            return
         if self._in_quiet_hours():
             return
         if self._count_today() >= self.daily_limit:
@@ -882,17 +930,27 @@ class SelfiePlugin(Star):
             mood(string): 神态表情，如「微微一笑」「害羞低头」「眯眼笑」
         """
         event = unwrap_event(event)
-        # AI 自己决定拍，也算「主动发图」，同样受每日配额约束。
-        # 只有用户明确发的 /自拍 命令不占配额。
-        if self._quota_exhausted():
-            yield (
-                "今天的主动发图额度已经用完了，这次先不拍。"
-                "如果用户想看，让他自己发 /自拍。"
-            )
-            return
+        # 判断这次是「用户点名要」还是「AI 自己起意」。
+        # 用户点名的：不占配额、不受最小间隔限制，随时给。
+        # AI 自己想拍的：算主动发图，受每日配额 + 最小间隔双重约束。
+        user_asked = self._user_asked_for_photo(event)
+
+        if not user_asked:
+            if self._quota_exhausted():
+                yield (
+                    "今天的主动发图额度已经用完了，这次先不拍。"
+                    "如果用户想看，让他自己发 /自拍。"
+                )
+                return
+            if self._in_min_interval():
+                yield (
+                    "刚拍过没多久，现在不适合再主动拍。"
+                    "如果用户就是想看，让他发 /自拍，那个不受限制。"
+                )
+                return
 
         result = await self._do_selfie(event, scene, outfit, mood, count=1)
-        if result.startswith("自拍已发送"):
+        if result.startswith("自拍已发送") and not user_asked:
             self._consume_quota()
         yield result
         return
